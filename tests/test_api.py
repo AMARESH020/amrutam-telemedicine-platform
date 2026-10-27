@@ -123,3 +123,140 @@ def test_booking_idempotency_and_duplicate_slot(client):
     )
     assert consultations.status_code == 200
     assert len(consultations.json()) == 1
+    # Verify consultation status transitions.
+    doctor_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "doctor-booking@example.com",
+            "password": "doctor-test-password",
+        },
+    )
+    assert doctor_login.status_code == 200, doctor_login.text
+
+    doctor_headers = {
+        "Authorization": (
+            f"Bearer {doctor_login.json()['access_token']}"
+        )
+    }
+    consultation_id = first.json()["id"]
+
+    # A doctor must not skip directly from booked to completed.
+    invalid_transition = client.patch(
+        f"/api/v1/consultations/{consultation_id}/status",
+        json={"status": "completed"},
+        headers=doctor_headers,
+    )
+    assert invalid_transition.status_code == 409
+
+    # The consultation must follow the valid sequence.
+    for next_status in ["confirmed", "in_progress", "completed"]:
+        response = client.patch(
+            f"/api/v1/consultations/{consultation_id}/status",
+            json={"status": next_status},
+            headers=doctor_headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == next_status
+
+    # A completed consultation must remain terminal.
+    terminal_transition = client.patch(
+        f"/api/v1/consultations/{consultation_id}/status",
+        json={"status": "confirmed"},
+        headers=doctor_headers,
+    )
+    assert terminal_transition.status_code == 409
+
+def test_cancelled_slot_can_be_rebooked(client):
+    # Register and authenticate a patient.
+    assert register(client).status_code == 201
+    patient_headers = login(client)
+
+    # Create a doctor and a future availability slot.
+    db = SessionLocal()
+    try:
+        doctor_user = User(
+            email="doctor-rebook@example.com",
+            full_name="Rebooking Test Doctor",
+            password_hash=hash_password("doctor-test-password"),
+            role="doctor",
+        )
+        db.add(doctor_user)
+        db.flush()
+
+        doctor = Doctor(
+            user_id=doctor_user.id,
+            specialty="General Medicine",
+            bio="Rebooking test doctor",
+        )
+        db.add(doctor)
+        db.flush()
+
+        starts_at = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(days=1)
+        )
+
+        slot = AvailabilitySlot(
+            doctor_id=doctor.id,
+            starts_at=starts_at,
+            ends_at=starts_at + timedelta(minutes=30),
+            is_booked=False,
+        )
+        db.add(slot)
+        db.commit()
+        db.refresh(slot)
+        slot_id = slot.id
+    finally:
+        db.close()
+
+    payload = {
+        "slot_id": slot_id,
+        "reason": "Routine consultation",
+    }
+
+    # First patient books the slot.
+    first = client.post(
+        "/api/v1/bookings",
+        json=payload,
+        headers={
+            **patient_headers,
+            "Idempotency-Key": "rebook-test-key-001",
+        },
+    )
+    assert first.status_code == 201, first.text
+    first_id = first.json()["id"]
+
+    # The patient cancels the consultation.
+    cancelled = client.patch(
+        f"/api/v1/consultations/{first_id}/status",
+        json={"status": "cancelled"},
+        headers=patient_headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+
+    # The same slot can now be booked using a new idempotency key.
+    second = client.post(
+        "/api/v1/bookings",
+        json=payload,
+        headers={
+            **patient_headers,
+            "Idempotency-Key": "rebook-test-key-002",
+        },
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] != first_id
+
+    # Both records should remain, preserving cancellation history.
+    consultations = client.get(
+        "/api/v1/consultations",
+        headers=patient_headers,
+    )
+    assert consultations.status_code == 200
+
+    records = consultations.json()
+    assert len(records) == 2
+
+    statuses = {record["id"]: record["status"] for record in records}
+    assert statuses[first_id] == "cancelled"
+    assert statuses[second.json()["id"]] == "booked"

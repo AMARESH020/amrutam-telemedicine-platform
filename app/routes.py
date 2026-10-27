@@ -147,48 +147,199 @@ def list_consultations(db: Session = Depends(get_db), user: User = Depends(get_c
         stmt = stmt.where(Consultation.doctor_id == doctor.id) if doctor else stmt.where(Consultation.id == -1)
     return db.scalars(stmt).all()
 
-@router.patch("/consultations/{consultation_id}/status", response_model=ConsultationOut, tags=["consultations"])
-def update_status(consultation_id: int, data: StatusIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    allowed = {"booked", "confirmed", "in_progress", "completed", "cancelled"}
-    if data.status not in allowed: raise HTTPException(422, f"status must be one of {sorted(allowed)}")
+
+@router.patch(
+    "/consultations/{consultation_id}/status",
+    response_model=ConsultationOut,
+    tags=["consultations"],
+)
+def update_status(
+    consultation_id: int,
+    data: StatusIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    transitions = {
+        "booked": {"confirmed", "cancelled"},
+        "confirmed": {"in_progress", "cancelled"},
+        "in_progress": {"completed"},
+        "completed": set(),
+        "cancelled": set(),
+    }
+
+    if data.status not in transitions:
+        raise HTTPException(422, "Invalid consultation status")
+
     consultation = db.get(Consultation, consultation_id)
-    if not consultation: raise HTTPException(404, "Consultation not found")
-    doctor = db.scalar(select(Doctor).where(Doctor.user_id == user.id)) if user.role == "doctor" else None
-    permitted = user.role == "admin" or consultation.patient_id == user.id or (doctor and consultation.doctor_id == doctor.id)
-    if not permitted: raise HTTPException(403, "Not allowed to access this consultation")
-    if user.role == "patient" and data.status not in {"cancelled"}: raise HTTPException(403, "Patients may only cancel a booking")
-    if consultation.status in {"completed", "cancelled"}: raise HTTPException(409, "Terminal consultation cannot be changed")
-    old = consultation.status; consultation.status = data.status
+    if not consultation:
+        raise HTTPException(404, "Consultation not found")
+
+    doctor = None
+    if user.role == "doctor":
+        doctor = db.scalar(
+            select(Doctor).where(Doctor.user_id == user.id)
+        )
+
+    if user.role == "admin":
+        permitted = True
+    elif user.role == "patient":
+        permitted = consultation.patient_id == user.id
+    elif user.role == "doctor":
+        permitted = (
+            doctor is not None
+            and consultation.doctor_id == doctor.id
+        )
+    else:
+        permitted = False
+
+    if not permitted:
+        raise HTTPException(
+            403, "Not allowed to access this consultation"
+        )
+
+    if user.role == "patient" and data.status != "cancelled":
+        raise HTTPException(
+            403, "Patients may only cancel a booking"
+        )
+
+    if data.status not in transitions[consultation.status]:
+        raise HTTPException(
+            409,
+            f"Cannot change consultation from "
+            f"{consultation.status} to {data.status}",
+        )
+
+    old_status = consultation.status
+    consultation.status = data.status
+
     if data.status == "cancelled":
         slot = db.get(AvailabilitySlot, consultation.slot_id)
-        if slot: slot.is_booked = False
-    audit(db, user.id, "consultation.status_changed", "consultation", consultation.id, f"{old}->{data.status}")
-    db.commit(); db.refresh(consultation)
-    return consultation
+        if slot:
+            slot.is_booked = False
 
-@router.post("/consultations/{consultation_id}/prescriptions", status_code=201, tags=["prescriptions"])
-def create_prescription(consultation_id: int, data: PrescriptionIn, db: Session = Depends(get_db), user: User = Depends(require_roles("doctor", "admin"))):
+    audit(
+        db,
+        user.id,
+        "consultation.status_changed",
+        "consultation",
+        consultation.id,
+        f"{old_status}->{data.status}",
+    )
+
+    db.commit()
+    db.refresh(consultation)
+    return consultation
+@router.post(
+    "/consultations/{consultation_id}/prescriptions",
+    status_code=201,
+    tags=["prescriptions"],
+)
+def create_prescription(
+    consultation_id: int,
+    data: PrescriptionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("doctor", "admin")),
+):
     consultation = db.get(Consultation, consultation_id)
-    if not consultation: raise HTTPException(404, "Consultation not found")
-    doctor = db.scalar(select(Doctor).where(Doctor.user_id == user.id)) if user.role == "doctor" else None
-    if user.role == "doctor" and (not doctor or consultation.doctor_id != doctor.id):
-        raise HTTPException(403, "Doctors can only prescribe for their own consultations")
-    if consultation.status not in {"in_progress", "completed"}: raise HTTPException(409, "Consultation must be in progress or completed")
-    prescription = Prescription(consultation_id=consultation.id, doctor_id=consultation.doctor_id, notes=data.notes)
-    db.add(prescription); db.flush(); audit(db, user.id, "prescription.created", "prescription", prescription.id); db.commit(); db.refresh(prescription)
-    return {"id": prescription.id, "consultation_id": prescription.consultation_id, "doctor_id": prescription.doctor_id, "notes": prescription.notes, "created_at": prescription.created_at}
+
+    if not consultation:
+        raise HTTPException(404, "Consultation not found")
+
+    doctor = None
+    if user.role == "doctor":
+        doctor = db.scalar(
+            select(Doctor).where(Doctor.user_id == user.id)
+        )
+
+        if not doctor or consultation.doctor_id != doctor.id:
+            raise HTTPException(
+                403,
+                "Doctors can only prescribe for their own consultations",
+            )
+
+    if consultation.status not in {"in_progress", "completed"}:
+        raise HTTPException(
+            409,
+            "Consultation must be in progress or completed",
+        )
+
+    prescription = Prescription(
+        consultation_id=consultation.id,
+        doctor_id=consultation.doctor_id,
+        notes=data.notes,
+    )
+
+    db.add(prescription)
+    db.flush()
+
+    audit(
+        db,
+        user.id,
+        "prescription.created",
+        "prescription",
+        prescription.id,
+    )
+
+    db.commit()
+    db.refresh(prescription)
+
+    return {
+        "id": prescription.id,
+        "consultation_id": prescription.consultation_id,
+        "doctor_id": prescription.doctor_id,
+        "notes": prescription.notes,
+        "created_at": prescription.created_at,
+    }
+
 
 @router.get("/admin/analytics", tags=["admin"])
-def analytics(db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):
+def analytics(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_roles("admin")),
+):
     return {
         "users": db.query(User).count(),
         "doctors": db.query(Doctor).count(),
-        "available_slots": db.query(AvailabilitySlot).filter(AvailabilitySlot.is_booked.is_(False)).count(),
+        "available_slots": db.query(AvailabilitySlot)
+        .filter(AvailabilitySlot.is_booked.is_(False))
+        .count(),
         "consultations_total": db.query(Consultation).count(),
-        "consultations_by_status": {s: db.query(Consultation).filter(Consultation.status == s).count() for s in ["booked","confirmed","in_progress","completed","cancelled"]},
+        "consultations_by_status": {
+            status: db.query(Consultation)
+            .filter(Consultation.status == status)
+            .count()
+            for status in [
+                "booked",
+                "confirmed",
+                "in_progress",
+                "completed",
+                "cancelled",
+            ]
+        },
     }
 
+
 @router.get("/admin/audit-logs", tags=["admin"])
-def audit_logs(limit: int = Query(default=100, ge=1, le=500), db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):
-    rows = db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)).all()
-    return [{"id": r.id, "actor_user_id": r.actor_user_id, "action": r.action, "resource_type": r.resource_type, "resource_id": r.resource_id, "details": r.details, "created_at": r.created_at} for r in rows]
+def audit_logs(
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_roles("admin")),
+):
+    rows = db.scalars(
+        select(AuditLog)
+        .order_by(AuditLog.created_at.desc())
+        .limit(limit)
+    ).all()
+
+    return [
+        {
+            "id": row.id,
+            "actor_user_id": row.actor_user_id,
+            "action": row.action,
+            "resource_type": row.resource_type,
+            "resource_id": row.resource_id,
+            "details": row.details,
+            "created_at": row.created_at,
+        }
+        for row in rows
+    ]

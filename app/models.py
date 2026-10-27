@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, Text, UniqueConstraint,Index,text
+from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
+
 def utcnow_naive() -> datetime:
     """Return the current UTC time without timezone metadata for existing DB columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -38,10 +39,20 @@ class Consultation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     doctor_id: Mapped[int] = mapped_column(ForeignKey("doctors.id"), index=True)
-    slot_id: Mapped[int] = mapped_column(ForeignKey("availability_slots.id"), unique=True)
+    slot_id: Mapped[int] = mapped_column(ForeignKey("availability_slots.id")
+)
     status: Mapped[str] = mapped_column(String(30), default="booked", index=True)
     reason: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive)
+    __table_args__ = (
+    Index(
+        "uq_active_consultation_slot",
+        "slot_id",
+        unique=True,
+        postgresql_where=text("status != 'cancelled'"),
+        sqlite_where=text("status != 'cancelled'"),
+    ),
+)
 
 class Prescription(Base):
     __tablename__ = "prescriptions"
