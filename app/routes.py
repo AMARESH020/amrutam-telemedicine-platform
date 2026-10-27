@@ -1,14 +1,15 @@
 import json
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Form, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import User, Doctor, AvailabilitySlot, Consultation, Prescription, AuditLog, IdempotencyRecord
-from app.schemas import RegisterIn, LoginIn, UserOut, TokenOut, DoctorCreate, SlotCreate, SlotOut, BookingIn, ConsultationOut, StatusIn, PrescriptionIn
+from app.schemas import RegisterIn, LoginIn, UserOut, TokenOut, DoctorCreate, SlotCreate, SlotOut, BookingIn, ConsultationOut, StatusIn, PrescriptionIn, MFASetupIn, MFACodeIn, MFADisableIn
 from app.security import hash_password, verify_password, create_access_token, get_current_user, require_roles
+from app.mfa import encrypt_mfa_secret, decrypt_mfa_secret, generate_totp_secret, get_totp_provisioning_uri, verify_totp_secret, generate_recovery_codes, verify_user_mfa_code
 
 router = APIRouter()
 
@@ -28,39 +29,174 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
     db.commit(); db.refresh(user)
     return user
 
-@router.post("/auth/login", response_model=TokenOut, tags=["auth"])
-def login(data: LoginIn, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.email == data.email.lower()))
-    if not user or not user.is_active or not verify_password(data.password, user.password_hash):
-        raise HTTPException(401, "Invalid email or password")
-    return {"access_token": create_access_token(user), "token_type": "bearer"}
-@router.post("/auth/token", response_model=TokenOut, tags=["auth"])
-def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
-):
-    user = db.scalar(
-        select(User).where(User.email == form_data.username.lower())
-    )
+def _authenticate_password_login(
+    db: Session,
+    email: str,
+    password: str,
+    mfa_code: str | None,
+) -> dict:
+    user = db.scalar(select(User).where(User.email == email.lower()).with_for_update())
 
     if (
         not user
         or not user.is_active
-        or not verify_password(form_data.password, user.password_hash)
+        or not verify_password(password, user.password_hash)
     ):
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+
+    if user.mfa_enabled:
+        if not mfa_code:
+            raise HTTPException(
+                status_code=401,
+                detail="MFA code required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        valid, recovery_used = verify_user_mfa_code(user, mfa_code)
+
+        if not valid:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email, password, or MFA code",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if recovery_used:
+            audit(
+                db,
+                user.id,
+                "auth.mfa_recovery_used",
+                "user",
+                user.id,
+            )
+
+        # Persist the new TOTP counter or consumed recovery code before
+        # returning an access token.
+        db.commit()
 
     return {
         "access_token": create_access_token(user),
         "token_type": "bearer",
     }
 
+
+@router.post("/auth/login", response_model=TokenOut, tags=["auth"])
+def login(data: LoginIn, db: Session = Depends(get_db)):
+    return _authenticate_password_login(
+        db, data.email, data.password, data.mfa_code
+    )
+
+
+@router.post("/auth/token", response_model=TokenOut, tags=["auth"])
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    mfa_code: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+):
+    return _authenticate_password_login(
+        db, form_data.username, form_data.password, mfa_code
+    )
+
 @router.get("/auth/me", response_model=UserOut, tags=["auth"])
 def me(user: User = Depends(get_current_user)):
     return user
+
+
+@router.post("/auth/mfa/enroll", tags=["auth"])
+def enroll_mfa(
+    data: MFASetupIn,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if user.mfa_enabled:
+        raise HTTPException(409, "MFA is already enabled")
+
+    if not verify_password(data.password, user.password_hash):
+        raise HTTPException(401, "Invalid password")
+
+    secret = generate_totp_secret()
+    user.mfa_secret_encrypted = encrypt_mfa_secret(secret)
+    user.mfa_recovery_codes = None
+
+    audit(db, user.id, "auth.mfa_enrollment_started", "user", user.id)
+    db.commit()
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+    return {
+        "secret": secret,
+        "provisioning_uri": get_totp_provisioning_uri(secret, user.email),
+        "message": "Add this account to your authenticator, then confirm with /auth/mfa/enable.",
+    }
+
+
+@router.post("/auth/mfa/enable", tags=["auth"])
+def enable_mfa(
+    data: MFACodeIn,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if user.mfa_enabled:
+        raise HTTPException(409, "MFA is already enabled")
+
+    if not user.mfa_secret_encrypted:
+        raise HTTPException(409, "Start MFA enrollment first")
+
+    secret = decrypt_mfa_secret(user.mfa_secret_encrypted)
+
+    if not verify_totp_secret(secret, data.code):
+        raise HTTPException(400, "Invalid authenticator code")
+
+    recovery_codes, stored_digests = generate_recovery_codes()
+    user.mfa_enabled = True
+    user.mfa_recovery_codes = stored_digests
+
+    audit(db, user.id, "auth.mfa_enabled", "user", user.id)
+    db.commit()
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+    return {
+        "enabled": True,
+        "recovery_codes": recovery_codes,
+        "warning": "Save these recovery codes now. They are shown only once.",
+    }
+
+
+@router.post("/auth/mfa/disable", tags=["auth"])
+def disable_mfa(
+    data: MFADisableIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not user.mfa_enabled:
+        raise HTTPException(409, "MFA is not enabled")
+
+    if not verify_password(data.password, user.password_hash):
+        raise HTTPException(401, "Invalid password")
+
+    valid, _ = verify_user_mfa_code(user, data.code)
+
+    if not valid:
+        raise HTTPException(401, "Invalid authenticator or recovery code")
+
+    user.mfa_enabled = False
+    user.mfa_secret_encrypted = None
+    user.mfa_recovery_codes = None
+    user.mfa_last_totp_counter = None
+
+    audit(db, user.id, "auth.mfa_disabled", "user", user.id)
+    db.commit()
+
+    return {"enabled": False}
 
 @router.post("/doctors", status_code=201, tags=["doctors"])
 def create_doctor(data: DoctorCreate, db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):

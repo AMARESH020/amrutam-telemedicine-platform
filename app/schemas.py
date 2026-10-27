@@ -10,6 +10,20 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+    mfa_code: str | None = Field(default=None, min_length=6, max_length=64)
+
+
+class MFASetupIn(BaseModel):
+    password: str = Field(min_length=10, max_length=128)
+
+
+class MFACodeIn(BaseModel):
+    code: str = Field(min_length=6, max_length=64)
+
+
+class MFADisableIn(BaseModel):
+    password: str = Field(min_length=10, max_length=128)
+    code: str = Field(min_length=6, max_length=64)
 
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)

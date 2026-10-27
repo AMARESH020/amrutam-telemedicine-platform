@@ -17,6 +17,10 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive)
 
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default=text("false"))
+    mfa_secret_encrypted: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    mfa_recovery_codes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mfa_last_totp_counter: Mapped[int | None] = mapped_column(Integer, nullable=True)
 class Doctor(Base):
     __tablename__ = "doctors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

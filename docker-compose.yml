@@ -20,6 +20,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://amrutam:${POSTGRES_PASSWORD:-change_me_local_only}@db:5432/amrutam
       JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-before-deployment}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY}
 
       APP_ENV: development
     ports:

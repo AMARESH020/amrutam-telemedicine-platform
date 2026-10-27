@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pyotp
+
 from app.db import SessionLocal
 from app.models import User, Doctor, AvailabilitySlot
 from app.security import hash_password
@@ -329,3 +331,172 @@ def test_registration_rate_limit_returns_429(client):
     )
     assert response.status_code == 429
     assert int(response.headers["Retry-After"]) > 0
+def test_mfa_login_requires_code_and_recovery_codes_are_single_use(client):
+    email = "mfa-login@example.com"
+    assert register(client, email=email).status_code == 201
+    headers = login(client, email=email)
+
+    enrolled = client.post(
+        "/api/v1/auth/mfa/enroll",
+        headers=headers,
+        json={"password": "correct-horse-battery-staple"},
+    )
+    assert enrolled.status_code == 200, enrolled.text
+    secret = enrolled.json()["secret"]
+
+    enabled = client.post(
+        "/api/v1/auth/mfa/enable",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    recovery_codes = enabled.json()["recovery_codes"]
+    assert len(recovery_codes) == 8
+
+    password_only = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+        },
+    )
+    assert password_only.status_code == 401
+
+    wrong_code = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+            "mfa_code": "bad-code",
+        },
+    )
+    assert wrong_code.status_code == 401
+
+    recovery_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+            "mfa_code": recovery_codes[0],
+        },
+    )
+    assert recovery_login.status_code == 200, recovery_login.text
+
+    reused_recovery = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+            "mfa_code": recovery_codes[0],
+        },
+    )
+    assert reused_recovery.status_code == 401
+
+    # The OAuth password flow must enforce MFA too.
+    token_without_mfa = client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": email,
+            "password": "correct-horse-battery-staple",
+        },
+    )
+    assert token_without_mfa.status_code == 401
+
+    token_with_mfa = client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": email,
+            "password": "correct-horse-battery-staple",
+            "mfa_code": pyotp.TOTP(secret).now(),
+        },
+    )
+    assert token_with_mfa.status_code == 200, token_with_mfa.text
+
+    profile = client.get("/api/v1/auth/me", headers=headers)
+    assert profile.status_code == 200
+    assert "mfa_secret_encrypted" not in profile.json()
+    assert "mfa_recovery_codes" not in profile.json()
+
+
+def test_mfa_can_be_disabled_with_password_and_valid_code(client):
+    email = "mfa-disable@example.com"
+    assert register(client, email=email).status_code == 201
+    headers = login(client, email=email)
+
+    enrolled = client.post(
+        "/api/v1/auth/mfa/enroll",
+        headers=headers,
+        json={"password": "correct-horse-battery-staple"},
+    )
+    assert enrolled.status_code == 200, enrolled.text
+    secret = enrolled.json()["secret"]
+
+    enabled = client.post(
+        "/api/v1/auth/mfa/enable",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    disabled = client.post(
+        "/api/v1/auth/mfa/disable",
+        headers=headers,
+        json={
+            "password": "correct-horse-battery-staple",
+            "code": pyotp.TOTP(secret).now(),
+        },
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["enabled"] is False
+
+    # Accounts that have disabled MFA return to the normal password flow.
+    password_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+        },
+    )
+    assert password_login.status_code == 200, password_login.text
+def test_totp_code_cannot_be_reused(client):
+    email = "mfa-replay@example.com"
+    assert register(client, email=email).status_code == 201
+    headers = login(client, email=email)
+
+    enrolled = client.post(
+        "/api/v1/auth/mfa/enroll",
+        headers=headers,
+        json={"password": "correct-horse-battery-staple"},
+    )
+    assert enrolled.status_code == 200, enrolled.text
+    secret = enrolled.json()["secret"]
+
+    enabled = client.post(
+        "/api/v1/auth/mfa/enable",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    # Use an accepted code once, then attempt replay in the same time step.
+    code = pyotp.TOTP(secret).now()
+    first = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+            "mfa_code": code,
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    replay = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+            "mfa_code": code,
+        },
+    )
+    assert replay.status_code == 401
