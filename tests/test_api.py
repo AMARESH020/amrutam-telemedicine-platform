@@ -260,3 +260,72 @@ def test_cancelled_slot_can_be_rebooked(client):
     statuses = {record["id"]: record["status"] for record in records}
     assert statuses[first_id] == "cancelled"
     assert statuses[second.json()["id"]] == "booked"
+
+def test_login_rate_limit_returns_429(client):
+    for _ in range(5):
+        response = client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "rate-limit-missing@example.com",
+                "password": "WrongPassword123!",
+            },
+        )
+        assert response.status_code == 401
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "rate-limit-missing@example.com",
+            "password": "WrongPassword123!",
+        },
+    )
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0
+
+
+def test_token_endpoint_rate_limit_returns_429(client):
+    for _ in range(5):
+        response = client.post(
+            "/api/v1/auth/token",
+            data={
+                "username": "rate-limit-missing@example.com",
+                "password": "WrongPassword123!",
+            },
+        )
+        assert response.status_code == 401
+
+    response = client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": "rate-limit-missing@example.com",
+            "password": "WrongPassword123!",
+        },
+    )
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0
+
+
+def test_registration_rate_limit_returns_429(client):
+    for attempt in range(5):
+        response = client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": f"rate-limit-{attempt}@example.com",
+                "full_name": f"Rate Limit Patient {attempt}",
+                "password": "StrongTestPassword123!",
+                "role": "patient",
+            },
+        )
+        assert response.status_code == 201
+
+    response = client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "rate-limit-sixth@example.com",
+            "full_name": "Rate Limit Patient Sixth",
+            "password": "StrongTestPassword123!",
+            "role": "patient",
+        },
+    )
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0

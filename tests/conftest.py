@@ -5,9 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 from app.main import app
 from app.db import Base, engine
+from app.rate_limit import reset_rate_limits
 
 @pytest.fixture()
 def client():
+    reset_rate_limits()
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     with TestClient(app) as c:

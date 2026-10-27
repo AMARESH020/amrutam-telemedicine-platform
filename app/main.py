@@ -5,11 +5,13 @@ import time
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 from app.config import settings
 from app.routes import router
+from app.rate_limit import check_rate_limit
 
 
 logging.basicConfig(level=logging.INFO)
@@ -53,7 +55,21 @@ async def observability_middleware(request: Request, call_next):
     response = None
 
     try:
-        response = await call_next(request)
+        limited, retry_after = check_rate_limit(
+            request.method,
+            request.url.path,
+            request.client.host if request.client else "unknown",
+        )
+
+        if limited:
+            response = JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please try again later."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        else:
+            response = await call_next(request)
+
         status_code = response.status_code
         return response
     finally:
