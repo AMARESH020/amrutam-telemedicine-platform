@@ -1,5 +1,5 @@
 import os
-os.environ["DATABASE_URL"] = "sqlite:///./test_amrutam.db"
+os.environ.setdefault("DATABASE_URL", "sqlite:///./test_amrutam.db")
 os.environ["JWT_SECRET"] = "amrutam-test-only-jwt-secret-key-2026-not-for-production"
 from cryptography.fernet import Fernet
 os.environ["MFA_ENCRYPTION_KEY"] = Fernet.generate_key().decode("ascii")
