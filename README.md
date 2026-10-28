@@ -74,9 +74,10 @@ account limiter fails closed with HTTP 503.
 Operational limitations: account cooldowns do not replace IP throttling,
 MFA, monitoring, or gateway/WAF protections. The cooldown check for an
 incorrect password occurs after password verification, so it does not by
-itself eliminate password-hashing CPU costs. Account-specific Redis behavior
-has unit coverage using a fake Redis client; production load, multi-replica
-abuse scenarios, and account-limiter operation against a live Redis service
-remain to be validated. Keep the production JWT secret strong and stable:
+itself eliminate password-hashing CPU costs. Account-specific Redis behavior has unit coverage using a fake Redis client
+and passed a smoke test against the Docker Redis service covering hashed keys,
+progressive cooldowns, and reset behavior. Production load, multi-replica abuse
+scenarios, and broader operational behavior remain to be validated. Keep the
+production JWT secret strong and stable:
 rotating it changes account-key digests, so prior counters remain under their
 old keys until they expire.

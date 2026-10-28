@@ -60,8 +60,9 @@ a purely IP-based limit by sending requests from multiple addresses.
 **Residual risks and verification limits:** account-specific rate limiting
 does not replace IP-based throttling, gateway/WAF controls, MFA, alerting, or
 monitoring. Since an incorrect password is verified before the cooldown check,
-an attacker can still impose password-hashing work. The account-specific Redis
-path has fake-client unit tests, but its live-Redis behavior, multi-replica
-abuse handling, and production capacity have not been independently validated.
-The production JWT secret must be strong and stable because it is used to
-derive account limiter keys.
+an attacker can still impose password-hashing work. The account-specific Redis path has fake-client unit tests and passed
+a smoke test against the local Docker Redis service covering hashed keys,
+progressive cooldowns, and clearing state. Multi-replica abuse handling and
+production capacity have not been independently validated. The production JWT
+secret must be strong and stable because it is used to derive account limiter
+keys.
