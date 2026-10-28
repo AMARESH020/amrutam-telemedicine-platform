@@ -11,6 +11,12 @@ from app.models import User, Doctor, AvailabilitySlot, Consultation, Prescriptio
 from app.schemas import RegisterIn, LoginIn, UserOut, TokenOut, DoctorCreate, SlotCreate, SlotOut, BookingIn, ConsultationOut, StatusIn, PrescriptionIn, MFASetupIn, MFACodeIn, MFADisableIn, PaymentOut, PaymentStatusUpdateIn
 from app.security import hash_password, verify_password, create_access_token, get_current_user, require_roles
 from app.mfa import encrypt_mfa_secret, decrypt_mfa_secret, generate_totp_secret, get_totp_provisioning_uri, verify_totp_secret, generate_recovery_codes, verify_user_mfa_code
+from app.rate_limit import (
+    RateLimitBackendUnavailable,
+    check_account_cooldown,
+    record_account_auth_failure,
+    clear_account_auth_failures,
+)
 
 router = APIRouter()
 
@@ -30,6 +36,42 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
     db.commit(); db.refresh(user)
     return user
 
+def _raise_auth_limiter_unavailable(exc: Exception):
+    raise HTTPException(
+        status_code=503,
+        detail="Authentication protection is temporarily unavailable",
+        headers={"Retry-After": "1"},
+    ) from exc
+
+
+def _enforce_account_auth_cooldown(email: str) -> None:
+    try:
+        retry_after = check_account_cooldown(email)
+    except RateLimitBackendUnavailable as exc:
+        _raise_auth_limiter_unavailable(exc)
+
+    if retry_after > 0:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts. Try again shortly.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _record_failed_account_auth(email: str) -> None:
+    try:
+        record_account_auth_failure(email)
+    except RateLimitBackendUnavailable as exc:
+        _raise_auth_limiter_unavailable(exc)
+
+
+def _clear_failed_account_auth(email: str) -> None:
+    try:
+        clear_account_auth_failures(email)
+    except RateLimitBackendUnavailable as exc:
+        _raise_auth_limiter_unavailable(exc)
+
+
 def _authenticate_password_login(
     db: Session,
     email: str,
@@ -43,6 +85,8 @@ def _authenticate_password_login(
         or not user.is_active
         or not verify_password(password, user.password_hash)
     ):
+        _enforce_account_auth_cooldown(email)
+        _record_failed_account_auth(email)
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password",
@@ -51,6 +95,8 @@ def _authenticate_password_login(
 
     if user.mfa_enabled:
         if not mfa_code:
+            _enforce_account_auth_cooldown(email)
+            _record_failed_account_auth(email)
             raise HTTPException(
                 status_code=401,
                 detail="MFA code required",
@@ -60,6 +106,8 @@ def _authenticate_password_login(
         valid, recovery_used = verify_user_mfa_code(user, mfa_code)
 
         if not valid:
+            _enforce_account_auth_cooldown(email)
+            _record_failed_account_auth(email)
             raise HTTPException(
                 status_code=401,
                 detail="Invalid email, password, or MFA code",
@@ -79,6 +127,7 @@ def _authenticate_password_login(
         # returning an access token.
         db.commit()
 
+    _clear_failed_account_auth(email)
     return {
         "access_token": create_access_token(user),
         "token_type": "bearer",

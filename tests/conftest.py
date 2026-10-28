@@ -15,6 +15,7 @@ from app.rate_limit import reset_rate_limits
 def client(monkeypatch):
     # Keep endpoint tests isolated from any configured external Redis.
     monkeypatch.setattr(rate_limit_module, '_redis', None)
+    monkeypatch.setattr(rate_limit_module, '_sync_redis', None)
     reset_rate_limits()
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)

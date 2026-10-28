@@ -1,11 +1,14 @@
 ﻿"""Shared Redis sliding-window rate limiting with a local fallback."""
 
 from collections import deque
+from hashlib import sha256
+import hmac
 from math import ceil
 from threading import Lock
 from time import monotonic
 from uuid import uuid4
 
+from redis import Redis as SyncRedis
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -19,6 +22,8 @@ _LIMITS = {
 }
 
 _attempts: dict[tuple[str, str, str], deque[float]] = {}
+_account_failures: dict[str, tuple[int, float]] = {}
+_account_cooldowns: dict[str, float] = {}
 _lock = Lock()
 
 
@@ -55,6 +60,19 @@ return {0, 0}
 
 _redis = (
     Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+        health_check_interval=30,
+    )
+    if settings.redis_url
+    else None
+)
+
+
+_sync_redis = (
+    SyncRedis.from_url(
         settings.redis_url,
         decode_responses=True,
         socket_connect_timeout=1.0,
@@ -147,7 +165,143 @@ async def check_rate_limit(
     return bool(int(result[0])), int(result[1])
 
 
+
+_ACCOUNT_FAILURE_WINDOW_SECONDS = 900
+_ACCOUNT_COOLDOWN_AFTER_FAILURES = 6
+_ACCOUNT_MAX_COOLDOWN_SECONDS = 30
+
+_ACCOUNT_FAILURE_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+
+local delay = 0
+local threshold = tonumber(ARGV[2])
+if count >= threshold then
+    local exponent = math.min(count - threshold, 5)
+    delay = math.min(2 ^ exponent, tonumber(ARGV[3]))
+    redis.call('SET', KEYS[2], tostring(delay), 'EX', delay)
+end
+
+return {count, delay}
+"""
+
+_ACCOUNT_COOLDOWN_SCRIPT = """
+return redis.call('PTTL', KEYS[1])
+"""
+
+def _account_digest(email: str) -> str:
+    normalized_email = email.strip().lower().encode("utf-8")
+    secret = settings.jwt_secret.encode("utf-8")
+    return hmac.new(secret, normalized_email, sha256).hexdigest()
+
+
+def _account_keys(email: str) -> tuple[str, str]:
+    digest = _account_digest(email)
+    prefix = f"amrutam:auth-account:{digest}"
+    return f"{prefix}:failures", f"{prefix}:cooldown"
+
+
+def check_account_cooldown(email: str) -> int:
+    """Return the remaining account cooldown in seconds, or zero."""
+    failure_key, cooldown_key = _account_keys(email)
+
+    if _sync_redis is not None:
+        try:
+            remaining_ms = int(
+                _sync_redis.eval(_ACCOUNT_COOLDOWN_SCRIPT, 1, cooldown_key)
+            )
+        except RedisError as exc:
+            raise RateLimitBackendUnavailable from exc
+        return max(0, ceil(remaining_ms / 1000)) if remaining_ms > 0 else 0
+
+    if settings.app_env.lower() in {"production", "prod"}:
+        raise RateLimitBackendUnavailable(
+            "REDIS_URL must be configured when APP_ENV is production."
+        )
+
+    now = monotonic()
+    digest = _account_digest(email)
+    with _lock:
+        expiry = _account_cooldowns.get(digest, 0.0)
+        if expiry <= now:
+            _account_cooldowns.pop(digest, None)
+            return 0
+        return max(1, ceil(expiry - now))
+
+
+def record_account_auth_failure(email: str) -> int:
+    """Record a failed factor and return any newly applied cooldown."""
+    failure_key, cooldown_key = _account_keys(email)
+
+    if _sync_redis is not None:
+        try:
+            result = _sync_redis.eval(
+                _ACCOUNT_FAILURE_SCRIPT,
+                2,
+                failure_key,
+                cooldown_key,
+                _ACCOUNT_FAILURE_WINDOW_SECONDS,
+                _ACCOUNT_COOLDOWN_AFTER_FAILURES,
+                _ACCOUNT_MAX_COOLDOWN_SECONDS,
+            )
+        except RedisError as exc:
+            raise RateLimitBackendUnavailable from exc
+        return int(result[1])
+
+    if settings.app_env.lower() in {"production", "prod"}:
+        raise RateLimitBackendUnavailable(
+            "REDIS_URL must be configured when APP_ENV is production."
+        )
+
+    digest = _account_digest(email)
+    now = monotonic()
+
+    with _lock:
+        previous = _account_failures.get(digest)
+        if previous is None or previous[1] <= now:
+            count = 1
+        else:
+            count = previous[0] + 1
+
+        _account_failures[digest] = (
+            count,
+            now + _ACCOUNT_FAILURE_WINDOW_SECONDS,
+        )
+
+        delay = 0
+        if count >= _ACCOUNT_COOLDOWN_AFTER_FAILURES:
+            exponent = min(count - _ACCOUNT_COOLDOWN_AFTER_FAILURES, 5)
+            delay = min(2 ** exponent, _ACCOUNT_MAX_COOLDOWN_SECONDS)
+            _account_cooldowns[digest] = now + delay
+
+        return delay
+
+
+def clear_account_auth_failures(email: str) -> None:
+    """Clear failure and cooldown state after successful authentication."""
+    failure_key, cooldown_key = _account_keys(email)
+
+    if _sync_redis is not None:
+        try:
+            _sync_redis.delete(failure_key, cooldown_key)
+        except RedisError as exc:
+            raise RateLimitBackendUnavailable from exc
+        return
+
+    if settings.app_env.lower() in {"production", "prod"}:
+        raise RateLimitBackendUnavailable(
+            "REDIS_URL must be configured when APP_ENV is production."
+        )
+
+    digest = _account_digest(email)
+    with _lock:
+        _account_failures.pop(digest, None)
+        _account_cooldowns.pop(digest, None)
+
+
 def reset_rate_limits() -> None:
     """Clear in-memory counters for isolated automated tests."""
     with _lock:
         _attempts.clear()
+        _account_failures.clear()
+        _account_cooldowns.clear()
