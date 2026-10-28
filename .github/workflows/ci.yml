@@ -82,3 +82,43 @@ jobs:
 
       - name: Run automated tests against PostgreSQL
         run: python -m pytest -q
+
+  test-redis-integration:
+    name: Account cooldown API integration (Redis)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: sqlite:////tmp/amrutam_redis_ci_${{ github.run_id }}_${{ github.run_attempt }}.sqlite3
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET: ci-only-secret-not-for-production
+      APP_ENV: test
+      RUN_REDIS_INTEGRATION_TESTS: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Check Python syntax
+        run: python -m compileall -q app alembic tests
+
+      - name: Run real-Redis account cooldown integration test
+        run: python -m pytest -q tests/test_redis_integration.py
