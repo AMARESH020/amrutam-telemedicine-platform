@@ -212,16 +212,29 @@ def create_doctor(data: DoctorCreate, db: Session = Depends(get_db), admin: User
 
 @router.get("/doctors", tags=["doctors"])
 def search_doctors(specialty: str | None = Query(default=None), q: str | None = Query(default=None), db: Session = Depends(get_db)):
-    stmt = select(Doctor).where(Doctor.active.is_(True))
+    stmt = (
+        select(Doctor, User.full_name)
+        .outerjoin(User, User.id == Doctor.user_id)
+        .where(Doctor.active.is_(True))
+    )
     if specialty:
         stmt = stmt.where(Doctor.specialty.ilike(f"%{specialty}%"))
-    doctors = db.scalars(stmt.order_by(Doctor.id)).all()
+
+    doctors = db.execute(stmt.order_by(Doctor.id)).all()
     output = []
-    for d in doctors:
-        u = db.get(User, d.user_id)
-        if q and q.lower() not in (u.full_name + " " + d.specialty + " " + d.bio).lower():
+    for d, full_name in doctors:
+        name = full_name if full_name is not None else "Unknown"
+        searchable_text = (
+            name + " " + (d.specialty or "") + " " + (d.bio or "")
+        ).lower()
+        if q and q.lower() not in searchable_text:
             continue
-        output.append({"id": d.id, "name": u.full_name if u else "Unknown", "specialty": d.specialty, "bio": d.bio})
+        output.append({
+            "id": d.id,
+            "name": name,
+            "specialty": d.specialty,
+            "bio": d.bio,
+        })
     return output
 
 @router.post("/doctors/{doctor_id}/slots", response_model=SlotOut, status_code=201, tags=["availability"])
