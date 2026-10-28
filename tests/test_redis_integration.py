@@ -36,7 +36,7 @@ def test_account_cooldown_through_api_with_real_redis():
         pytest.fail(f"Refusing to overwrite an existing test database: {db_path}")
 
     token = uuid4().hex
-    email = f"redis-api-{token}@example.invalid"
+    email = f"redis-api-{token}@example.com"
     password = "Redis-Smoke-Test-482!x"
     wrong_password = "Wrong-Redis-Test-731!x"
     client_ip = f"198.18.{uuid4().int & 255}.{(uuid4().int >> 8) & 255}"
