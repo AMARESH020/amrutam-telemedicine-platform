@@ -13,7 +13,7 @@ from app.config import settings
 from app.db import engine
 from app.telemetry import configure_tracing
 from app.routes import router
-from app.rate_limit import check_rate_limit
+from app.rate_limit import check_rate_limit, RateLimitBackendUnavailable
 
 
 logging.basicConfig(level=logging.INFO)
@@ -57,20 +57,28 @@ async def observability_middleware(request: Request, call_next):
     response = None
 
     try:
-        limited, retry_after = check_rate_limit(
-            request.method,
-            request.url.path,
-            request.client.host if request.client else "unknown",
-        )
-
-        if limited:
+        try:
+            limited, retry_after = await check_rate_limit(
+                request.method,
+                request.url.path,
+                request.client.host if request.client else "unknown",
+            )
+        except RateLimitBackendUnavailable:
+            logger.error("rate_limit_backend_unavailable")
             response = JSONResponse(
-                status_code=429,
-                content={"detail": "Too many requests. Please try again later."},
-                headers={"Retry-After": str(retry_after)},
+                status_code=503,
+                content={"detail": "Rate limiting service is temporarily unavailable."},
+                headers={"Retry-After": "1"},
             )
         else:
-            response = await call_next(request)
+            if limited:
+                response = JSONResponse(
+                    status_code=429,
+                    content={"detail": "Too many requests. Please try again later."},
+                    headers={"Retry-After": str(retry_after)},
+                )
+            else:
+                response = await call_next(request)
 
         status_code = response.status_code
         return response

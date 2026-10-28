@@ -9,5 +9,6 @@ class Settings(BaseSettings):
     mfa_encryption_key: str = ""
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
     app_env: str = "development"
+    redis_url: str | None = None
 
 settings = Settings()

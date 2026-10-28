@@ -36,15 +36,15 @@ flowchart TD
     API --> MET
     API --> LOG
 
-    REDIS[Planned Shared Rate Limit and Cache]
+    REDIS["Redis Shared Authentication Rate Limit; cache planned"]
     QUEUE[Planned Durable Job Queue and Workers]
     TRACE[Jaeger OTLP Collector and Trace UI]
-    API -. future integration .-> REDIS
+    API --> REDIS
     API -. future integration .-> QUEUE
     API --> TRACE
 ```
 
-The local Docker Compose stack runs FastAPI, PostgreSQL, and Jaeger. The API exposes `/health`, `/metrics`, and OpenAPI endpoints at `/openapi.json` and `/docs`. Request logs are structured JSON and include request IDs. Prometheus counters and latency histograms are exposed at `/metrics`. When running under Compose, OpenTelemetry exports FastAPI request and SQLAlchemy database spans over OTLP/HTTP to Jaeger, available at `http://localhost:16686`. A production metrics backend, alerting policy, trace retention, and production-grade collection deployment still need to be designed and operated.
+The local Docker Compose stack runs FastAPI, PostgreSQL, Redis, and Jaeger. Redis provides shared IP-based sliding-window rate limiting for the authentication endpoints; Redis caching is not enabled. The API also exposes `/health`, `/metrics`, and OpenAPI endpoints at `/openapi.json` and `/docs`. Request logs are structured JSON and include request IDs. Prometheus counters and latency histograms are exposed at `/metrics`. When running under Compose, OpenTelemetry exports FastAPI request and SQLAlchemy database spans over OTLP/HTTP to Jaeger, available at `http://localhost:16686`. A production metrics backend, alerting policy, trace retention, and production-grade collection deployment still need to be designed and operated.
 
 ## 3. Booking sequence and transaction boundaries
 
@@ -209,17 +209,17 @@ Recommended production sequence:
 
 1. Measure query plans, request latency, connection-pool saturation, and booking conflicts under representative load.
 2. Scale stateless API instances behind a load balancer and size PostgreSQL connection pools for the total replica count.
-3. Add Redis for shared rate limits and carefully selected doctor-directory caching, with TTLs and explicit invalidation.
+3. Redis-backed shared authentication rate limiting is implemented. Add Redis caching for carefully selected doctor-directory reads only after defining TTLs and explicit invalidation.
 4. Evaluate PostgreSQL read replicas for read-heavy endpoints.
 5. Consider monthly range partitioning for consultations and audit logs only when measured table growth and query patterns justify the operational cost.
 
-Do not cache private medical records without a reviewed authorization, invalidation, and privacy design. Partitioning, Redis, read replicas, and load capacity have not been validated in the current demo deployment.
+Do not cache private medical records without a reviewed authorization, invalidation, and privacy design. Shared authentication rate limiting has been tested locally against Docker Redis; Redis caching, partitioning, read replicas, and production-scale load capacity have not been validated in the current demo deployment.
 
 ## 9. Security and privacy
 
-Implemented controls include Argon2 password hashing, signed expiring JWTs, patient-only public registration, RBAC/ownership checks, TOTP MFA with encrypted secrets and recovery-code/TOTP replay protection, input validation, selected business audit events, and authentication-route IP rate limiting.
+Implemented controls include Argon2 password hashing, signed expiring JWTs, patient-only public registration, RBAC/ownership checks, TOTP MFA with encrypted secrets and recovery-code/TOTP replay protection, input validation, selected business audit events, and Redis-backed shared IP rate limiting on POST `/api/v1/auth/login`, `/api/v1/auth/token`, and `/api/v1/auth/register` (five requests per 60 seconds per endpoint and client IP). The limiter uses an atomic Redis sliding-window script; when configured Redis is unavailable, protected authentication requests fail closed with HTTP 503.
 
-The current rate limiter is process-local. It does not coordinate multiple API replicas and is not a substitute for gateway or distributed rate limiting. Production controls still required include managed secret/key storage and rotation, centralized rate limits, image and secret scanning, TLS configuration at the production boundary, verified encryption-at-rest settings, PHI redaction tests, access reviews, retention policy, and a threat-model/security review.
+When `REDIS_URL` is not configured, development and tests may use the process-local fallback; in `APP_ENV=production`, the limiter fails closed with HTTP 503 instead of silently weakening protection. Production hardening still includes gateway/WAF protections, per-account limits, managed secret/key storage and rotation, image and secret scanning, TLS configuration at the production boundary, verified encryption-at-rest settings, PHI redaction tests, access reviews, retention policy, and a threat-model/security review.
 
 Never log passwords, bearer tokens, recovery codes, payment secrets, or clinical notes. The demo does not establish regulatory compliance or production certification; applicable Indian privacy and healthcare obligations need review by qualified professionals before launch.
 
@@ -247,7 +247,7 @@ Production readiness requires a defined recovery-point objective (RPO) and recov
 | Audit events and admin analytics | Implemented |
 | Request logs, Prometheus metrics, and traces | Implemented locally; production dashboards/alerts/retention needed |
 | Distributed tracing | Implemented locally using OpenTelemetry and Jaeger |
-| Shared rate limiting and Redis cache | Not implemented |
+| Shared authentication rate limiting | Implemented with Redis; Docker integration tested. Broader gateway controls and Redis caching remain outstanding |
 | Durable asynchronous workers/outbox | Not implemented |
 | Load test for target latency/throughput | Not completed |
 | Automated backup restore and disaster-recovery drills | Not completed |

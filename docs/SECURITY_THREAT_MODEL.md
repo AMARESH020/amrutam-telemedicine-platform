@@ -14,7 +14,7 @@
 | Privilege escalation | Patient self-registration only; RBAC and ownership checks | Admin provisioning workflow and periodic access review |
 | Double booking | Idempotency key, transaction, uniqueness constraints, row lock on PostgreSQL | Load test against PostgreSQL; idempotency TTL and key/request fingerprint |
 | Injection | SQLAlchemy parameterized queries; Pydantic validation | SAST/DAST and security review |
-| Brute force/DoS | Not fully implemented | API gateway rate limits, per-account/IP limits, WAF |
+| Brute force/DoS | Redis-backed IP sliding-window limit on login, token, and registration (5 requests per 60 seconds per endpoint/IP); configured Redis failure returns 503 | API gateway/WAF, per-account limits, broader DDoS protection, and alerting |
 | PHI leakage | No request-body logging added | Redaction tests, access monitoring, encryption/key management |
 | Insider misuse | Audit events for key changes | Append-only/central audit store, alerting, retention policy |
 | Dependency compromise | CI dependency installation | Dependabot, pinned lock file, SBOM and image scanning |
@@ -28,7 +28,7 @@
 - [x] Booking idempotency and database uniqueness constraints.
 - [x] Audit records for key business actions.
 - [x] TOTP MFA enrollment, encrypted secret storage, recovery-code single use and TOTP replay protection tested.
-- [ ] Centralized rate limiting.
+- [x] Redis-backed shared IP rate limiting for login, token, and registration; live Redis integration and fail-closed behavior tested. Gateway/WAF and per-account limits remain outstanding.
 - [ ] Production key management and key rotation.
 - [ ] Automated dependency/image scanning and secret scanning.
 - [ ] Encryption-at-rest configuration verified for deployment.
