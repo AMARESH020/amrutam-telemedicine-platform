@@ -1,40 +1,255 @@
 # Amrutam Telemedicine Backend — Architecture
 
-## Scope and design
-The API is a modular monolith built with FastAPI and PostgreSQL. Modules cover identity, doctor directory and availability, booking, consultation lifecycle, prescriptions, audit, and admin analytics. A modular monolith is a deliberate first release choice: it reduces operational overhead while keeping boundaries clear enough to split high-load components later.
+## 1. Scope and architecture decisions
 
-## High-level flow
-Client → TLS-terminating load balancer/API gateway → FastAPI application → PostgreSQL. Authentication uses short-lived signed JWT access tokens. Write workflows use database transactions; booking accepts an `Idempotency-Key`. Audit events are persisted with the corresponding business transaction. For production, add Redis for rate-limit counters/cache and a durable queue (e.g. managed queue) for notifications and other non-critical asynchronous work.
+The application is a modular monolith built with FastAPI, SQLAlchemy, Alembic, and PostgreSQL. Modules cover authentication, doctor directory and availability, consultation booking and lifecycle, prescriptions, payment records, audit events, and administrative analytics.
 
-## Booking sequence
-1. Patient authenticates and sends `POST /api/v1/bookings` with `Idempotency-Key`.
-2. API validates role and request; looks up a prior response for the same key.
-3. API locks the slot row where supported, checks availability and start time, then creates the consultation and marks the slot booked in one transaction.
-4. A unique constraint on `consultations.slot_id` and a unique idempotency key provide additional race protection.
-5. The API records an audit event and commits. Repeated same-user requests return the saved response.
+A modular monolith is appropriate for the current assignment because it keeps deployment and transaction management simple while allowing service boundaries to be introduced later if measured load or team ownership justifies them.
 
-## Data model
-`users` 1—0..1 `doctors`; `doctors` 1—many `availability_slots`; `availability_slots` 1—0..1 `consultations`; `users` (patient) 1—many `consultations`; `consultations` 1—many `prescriptions`; `users` 1—many `audit_logs`; `users` 1—many `idempotency_records`.
+The assignment target is 100,000 consultations per day, read p95 below 200 ms, write p95 below 500 ms, and 99.95% availability. These are design targets, not verified performance or availability results. Load testing and production deployment evidence are still required.
 
-## Reliability and concurrency
-Use bounded retries with exponential backoff and jitter only for transient failures and only when the operation is safe to retry. Do not blindly retry non-idempotent writes. The current synchronous API relies on database transactions and constraints; PostgreSQL row locks serialize competing bookings. SQLite is only a local smoke-test fallback and does not provide equivalent row-lock semantics. Add deadlock/serialization retry middleware for production and monitor conflict rates.
+## 2. High-level architecture and data flow
 
-## Scaling and partitioning
-100k consultations/day averages about 1.16 consultations/second; peak traffic may be many times higher. Scale stateless API replicas horizontally behind a load balancer. Index foreign keys, status and time-based lookup fields. Begin with a properly sized PostgreSQL primary plus read replicas for read-heavy traffic. Consider monthly range partitioning of consultations/audit logs only after query plans and table growth justify it. Use Redis for cacheable doctor directory reads, with short TTLs and explicit invalidation on profile changes. Never cache private medical records without a reviewed access-control and invalidation design.
+```mermaid
+flowchart TD
+    C[Patient, Doctor, Admin Client]
+    LB[Production TLS Load Balancer / API Gateway]
+    API[FastAPI Modular Application]
+    AUTH[JWT Authentication, RBAC, TOTP MFA]
+    BOOK[Booking and Consultation Services]
+    PAY[Provider-Neutral Payment Records]
+    AUD[Audit Events]
+    DB[(PostgreSQL)]
+    MET[Prometheus /metrics]
+    LOG[JSON Request Logs and Request IDs]
 
-## Transactions and sagas
-Booking is a single local transaction. Payment, notification and video-provider integrations are external side effects: use an outbox table plus worker, idempotent consumers, bounded retries and a saga/state machine for compensation (e.g. release a slot if payment fails). Do not hold a database transaction open while calling external services.
+    C -->|HTTPS, Bearer token| LB
+    LB --> API
+    API --> AUTH
+    API --> BOOK
+    API --> PAY
+    API --> AUD
+    AUTH --> DB
+    BOOK --> DB
+    PAY --> DB
+    AUD --> DB
+    API --> MET
+    API --> LOG
 
-## Security and privacy
-Public registration only creates patient accounts. Staff accounts must be provisioned through a trusted administrative process. Enforce RBAC and ownership checks, parameterized ORM queries, input constraints, TLS in transit, encrypted storage/backups, secret-manager storage, rotation, least privilege, rate limiting and dependency/image scanning. Never log passwords, tokens, payment details or clinical notes. Apply data minimization and retention rules; verify applicable Indian healthcare/privacy requirements with qualified counsel before production. TOTP MFA with encrypted secrets, one-time recovery codes and replay protection is implemented; key rotation and recovery procedures still need operational runbooks.
+    REDIS[Planned Shared Rate Limit and Cache]
+    QUEUE[Planned Durable Job Queue and Workers]
+    TRACE[Planned OpenTelemetry Collector]
+    API -. future integration .-> REDIS
+    API -. future integration .-> QUEUE
+    API -. future integration .-> TRACE
+```
 
-## Observability
-Add structured request logs with request IDs; collect RED metrics (rate, errors, duration), DB pool saturation, booking conflicts, auth failures and queue lag. Expose Prometheus metrics in production and propagate trace context via OpenTelemetry. Alert on error budget burn, elevated p95, database saturation and failed backups. The included CI installs a test suite; deployment pipeline should add image scanning, migration checks and environment approval.
+The deployed assignment implementation uses the FastAPI application and PostgreSQL. The TLS load balancer, Redis-based distributed controls, durable worker queue, and OpenTelemetry collection shown as planned components are production architecture recommendations, not components currently delivered by the local Docker Compose stack.
 
-## Availability, backup and disaster recovery
-99.95% availability permits about 21.6 minutes of downtime in a 30-day month. Use multi-zone application/database deployment, automated encrypted backups, point-in-time recovery, regular restore drills, documented RPO/RTO, and a tested regional recovery plan. Actual targets must be measured in a deployed environment.
+The API exposes `/health`, `/metrics`, and FastAPI-generated OpenAPI endpoints at `/openapi.json` and `/docs`. Request logging includes request identifiers. Prometheus metrics are exposed by the application; a production metrics backend, alerting policy, and distributed tracing deployment are still needed.
 
+## 3. Booking sequence and transaction boundaries
 
-## Payment records
+```mermaid
+sequenceDiagram
+    actor Patient
+    participant API as FastAPI
+    participant DB as PostgreSQL
 
-The payment table stores a server-priced, provider-neutral intent and manual reconciliation state. It stores no cardholder data. The configured demo amount is `AMRUTAM_CONSULTATION_FEE_MINOR` in paise (default 50000 = INR 500.00); a patient cannot submit the amount. Unique idempotency keys and a partial unique index prevent duplicate active payment records for a consultation. Admin reconciliation is authenticated, transition-checked and audited. No payment gateway, signed webhook, real collection, refund execution or settlement is implemented; these require a selected provider and provider-verified events before production.
+    Patient->>API: POST /api/v1/bookings
+    Note over Patient,API: Bearer token and Idempotency-Key
+    API->>API: Authenticate and validate patient role
+    API->>DB: Look up idempotency key
+    alt Previously completed request
+        DB-->>API: Stored response
+        API-->>Patient: Original booking response
+    else New request
+        API->>DB: Begin transaction and lock/check slot
+        API->>DB: Create consultation and mark slot booked
+        API->>DB: Store idempotency response and audit event
+        API->>DB: Commit
+        DB-->>API: Committed records
+        API-->>Patient: Booking response
+    end
+```
+
+Booking is implemented as a database transaction. PostgreSQL row locking serializes competing access where supported, while database uniqueness constraints provide additional protection against duplicate active bookings. Cancelled consultations remain in history and release their slots for rebooking. The booking endpoint requires an `Idempotency-Key`.
+
+A repeated key from the same patient returns the stored response; a key owned by another patient is rejected. Production hardening should also persist a canonical request fingerprint and retention policy for idempotency records. SQLite is useful for isolated automated tests, but it does not offer equivalent row-locking behavior to PostgreSQL.
+
+Audit events are written in the business transaction where the workflow supports it. A production outbox and durable worker should be introduced before integrating external notification, video, or payment services.
+
+## 4. Payment-intent flow
+
+```mermaid
+sequenceDiagram
+    actor Patient
+    participant API as FastAPI
+    participant DB as PostgreSQL
+    actor Admin
+
+    Patient->>API: POST consultation payment intent
+    Note over Patient,API: Bearer token and Idempotency-Key
+    API->>API: Verify ownership and consultation state
+    API->>API: Read server-side fee configuration
+    API->>DB: Insert pending payment and audit event
+    DB-->>API: Persisted payment record
+    API-->>Patient: Pending intent (no charge made)
+
+    Admin->>API: Authenticated status reconciliation
+    API->>API: Validate role, transition and reference
+    API->>DB: Update status and write audit event
+    DB-->>API: Commit
+    API-->>Admin: Updated payment record
+```
+
+The `payments` table stores amounts in minor currency units (paise), currency, status, provider label, optional provider reference, idempotency key, and timestamps. The default demo fee is 50,000 paise (INR 500.00), configurable through `AMRUTAM_CONSULTATION_FEE_MINOR`. The patient cannot supply the amount.
+
+Payment creation is provider-neutral and does not transfer money. Manual status reconciliation is restricted to administrators, validates transitions, and creates audit records. A real gateway adapter, verified signed webhooks, settlement and refund execution, provider-side idempotency, and reconciliation against provider statements are not implemented.
+
+## 5. Entity relationships
+
+```mermaid
+erDiagram
+    USERS ||--o| DOCTORS : "doctor profile"
+    DOCTORS ||--o{ AVAILABILITY_SLOTS : publishes
+    AVAILABILITY_SLOTS ||--o{ CONSULTATIONS : "booking history"
+    USERS ||--o{ CONSULTATIONS : "patient"
+    DOCTORS ||--o{ CONSULTATIONS : attends
+    CONSULTATIONS ||--o{ PRESCRIPTIONS : produces
+    CONSULTATIONS ||--o{ PAYMENTS : records
+    USERS ||--o{ PAYMENTS : owns
+    USERS ||--o{ AUDIT_LOGS : acts
+    USERS ||--o{ IDEMPOTENCY_RECORDS : owns
+
+    USERS {
+        int id PK
+        string email UK
+        string role
+        boolean is_active
+        boolean mfa_enabled
+    }
+    DOCTORS {
+        int id PK
+        int user_id FK
+        string specialty
+        boolean active
+    }
+    AVAILABILITY_SLOTS {
+        int id PK
+        int doctor_id FK
+        datetime starts_at
+        datetime ends_at
+        boolean is_booked
+    }
+    CONSULTATIONS {
+        int id PK
+        int patient_id FK
+        int doctor_id FK
+        int slot_id FK
+        string status
+    }
+    PRESCRIPTIONS {
+        int id PK
+        int consultation_id FK
+        int doctor_id FK
+        text notes
+    }
+    PAYMENTS {
+        int id PK
+        int consultation_id FK
+        int patient_id FK
+        int amount_minor
+        string currency
+        string status
+        string idempotency_key UK
+    }
+    AUDIT_LOGS {
+        int id PK
+        int actor_user_id FK
+        string action
+        string resource_type
+        string resource_id
+    }
+    IDEMPOTENCY_RECORDS {
+        int id PK
+        int user_id FK
+        string key UK
+        text response_body
+    }
+```
+
+Cancelled consultations and historical payment attempts may be retained, so the relationship between a slot and its consultation history is one-to-many. Partial unique indexes restrict active bookings per slot and active payment records per consultation. The ER diagram describes logical relationships; the database constraints remain authoritative.
+
+## 6. API contract
+
+FastAPI generates an OpenAPI schema from route and Pydantic definitions. The interactive API reference is available at `/docs`, and the machine-readable schema is available at `/openapi.json`.
+
+Important route groups include:
+
+- Authentication: registration, login, current user, MFA enrollment/enable/disable.
+- Doctors and availability: directory search and slot management.
+- Bookings and consultations: idempotent booking, status transitions and prescriptions.
+- Payments: create intent, retrieve own payment, and admin-only manual reconciliation.
+- Administration: analytics and audit-log access.
+
+Protected routes use signed expiring JWT access tokens and role/ownership checks. Public registration creates patient accounts only; doctor and administrator accounts must be provisioned through a trusted process.
+
+## 7. Reliability, concurrency and retry policy
+
+Database transactions and uniqueness constraints protect the critical booking path. Payment-intent creation also uses idempotency keys and a database constraint to handle duplicate active records. Status transitions are validated before mutation.
+
+Retry policy must distinguish transient infrastructure failures from business conflicts. In a production deployment, retry safe operations only, with bounded exponential backoff and jitter. Do not blindly retry writes unless their idempotency semantics are guaranteed. Deadlock and serialization retries, timeouts, connection-pool limits, and conflict-rate monitoring require further implementation and validation.
+
+Do not hold a database transaction open while waiting for an external payment, notification, or video provider. For distributed workflows, use an outbox, idempotent consumers, bounded retries, and a defined compensation/state-machine policy. These asynchronous workflows are architectural recommendations, not currently delivered workers.
+
+## 8. Scaling, caching and partitioning
+
+The target workload of 100,000 consultations per day averages about 1.16 consultations per second; peak traffic can be much higher. Validate the design with realistic concurrency and query distributions before claiming the latency targets have been met.
+
+Recommended production sequence:
+
+1. Measure query plans, request latency, connection-pool saturation, and booking conflicts under representative load.
+2. Scale stateless API instances behind a load balancer and size PostgreSQL connection pools for the total replica count.
+3. Add Redis for shared rate limits and carefully selected doctor-directory caching, with TTLs and explicit invalidation.
+4. Evaluate PostgreSQL read replicas for read-heavy endpoints.
+5. Consider monthly range partitioning for consultations and audit logs only when measured table growth and query patterns justify the operational cost.
+
+Do not cache private medical records without a reviewed authorization, invalidation, and privacy design. Partitioning, Redis, read replicas, and load capacity have not been validated in the current demo deployment.
+
+## 9. Security and privacy
+
+Implemented controls include Argon2 password hashing, signed expiring JWTs, patient-only public registration, RBAC/ownership checks, TOTP MFA with encrypted secrets and recovery-code/TOTP replay protection, input validation, selected business audit events, and authentication-route IP rate limiting.
+
+The current rate limiter is process-local. It does not coordinate multiple API replicas and is not a substitute for gateway or distributed rate limiting. Production controls still required include managed secret/key storage and rotation, centralized rate limits, image and secret scanning, TLS configuration at the production boundary, verified encryption-at-rest settings, PHI redaction tests, access reviews, retention policy, and a threat-model/security review.
+
+Never log passwords, bearer tokens, recovery codes, payment secrets, or clinical notes. The demo does not establish regulatory compliance or production certification; applicable Indian privacy and healthcare obligations need review by qualified professionals before launch.
+
+## 10. Observability and operations
+
+Implemented observability includes request JSON logs with request identifiers and a Prometheus `/metrics` endpoint. `/health` provides an application health check. A production deployment should add database-aware readiness, a metrics backend, alerts, distributed tracing via OpenTelemetry, and dashboards for request rate, error rate, latency, database pool pressure, booking conflicts, authentication failures, and job-queue lag.
+
+The repository's CI workflow installs dependencies, compiles Python files, runs automated tests, and audits Python dependencies. Container image scanning, secret scanning, deployment approvals, and database migration integration tests should be added to CI.
+
+## 11. Availability, backup and disaster recovery
+
+The 99.95% availability target permits approximately 21.6 minutes of downtime in a 30-day month. The local Compose stack is not evidence that this target is met.
+
+Production readiness requires a defined recovery-point objective (RPO) and recovery-time objective (RTO), encrypted automated backups, point-in-time recovery, separately protected backup copies, regular restore drills, database monitoring, and a tested regional recovery plan. Multi-zone application and database deployment plus failover behavior must be validated in the target environment. The current repository has not established tested disaster recovery or measured production availability.
+
+## 12. Implementation status summary
+
+| Capability | Current status |
+|---|---|
+| FastAPI, PostgreSQL and Alembic | Implemented |
+| Authentication, roles, TOTP MFA | Implemented and tested |
+| Booking idempotency and slot constraints | Implemented; PostgreSQL concurrency load test needed |
+| Consultation lifecycle and prescriptions | Implemented |
+| Payment-intent records and admin reconciliation | Implemented; no real gateway |
+| Audit events and admin analytics | Implemented |
+| Request logs and Prometheus metrics | Implemented; production dashboards/alerts needed |
+| Distributed tracing | Not implemented |
+| Shared rate limiting and Redis cache | Not implemented |
+| Durable asynchronous workers/outbox | Not implemented |
+| Load test for target latency/throughput | Not completed |
+| Automated backup restore and disaster-recovery drills | Not completed |
