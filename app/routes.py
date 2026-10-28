@@ -1,4 +1,5 @@
 import json
+import os
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Form, Response
@@ -6,8 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.db import get_db
-from app.models import User, Doctor, AvailabilitySlot, Consultation, Prescription, AuditLog, IdempotencyRecord
-from app.schemas import RegisterIn, LoginIn, UserOut, TokenOut, DoctorCreate, SlotCreate, SlotOut, BookingIn, ConsultationOut, StatusIn, PrescriptionIn, MFASetupIn, MFACodeIn, MFADisableIn
+from app.models import User, Doctor, AvailabilitySlot, Consultation, Prescription, AuditLog, IdempotencyRecord, Payment
+from app.schemas import RegisterIn, LoginIn, UserOut, TokenOut, DoctorCreate, SlotCreate, SlotOut, BookingIn, ConsultationOut, StatusIn, PrescriptionIn, MFASetupIn, MFACodeIn, MFADisableIn, PaymentOut, PaymentStatusUpdateIn
 from app.security import hash_password, verify_password, create_access_token, get_current_user, require_roles
 from app.mfa import encrypt_mfa_secret, decrypt_mfa_secret, generate_totp_secret, get_totp_provisioning_uri, verify_totp_secret, generate_recovery_codes, verify_user_mfa_code
 
@@ -479,3 +480,135 @@ def audit_logs(
         }
         for row in rows
     ]
+
+# Payment intents are provider-neutral records only. A real gateway is not configured,
+# so creating an intent does not charge a card or move money. Amounts are configured
+# on the server in paise; clients cannot set or override them.
+def _consultation_fee_minor() -> int:
+    raw = os.getenv("AMRUTAM_CONSULTATION_FEE_MINOR", "50000")  # demo default: INR 500.00
+    try:
+        amount = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(500, "Payment amount configuration is invalid")
+    if amount <= 0:
+        raise HTTPException(500, "Payment amount configuration must be positive")
+    return amount
+
+
+@router.post(
+    "/consultations/{consultation_id}/payments",
+    response_model=PaymentOut,
+    status_code=201,
+    tags=["payments"],
+)
+def create_payment_intent(
+    consultation_id: int,
+    response: Response,
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=160),
+    db: Session = Depends(get_db),
+    patient: User = Depends(require_roles("patient")),
+):
+    prior = db.scalar(select(Payment).where(Payment.idempotency_key == idempotency_key))
+    if prior:
+        if prior.patient_id != patient.id or prior.consultation_id != consultation_id:
+            raise HTTPException(409, "Idempotency key was already used for a different payment request")
+        response.status_code = 200
+        return prior
+
+    consultation = db.get(Consultation, consultation_id)
+    # Return 404 for another patient's consultation to avoid confirming its existence.
+    if not consultation or consultation.patient_id != patient.id:
+        raise HTTPException(404, "Consultation not found")
+    if consultation.status not in {"booked", "confirmed"}:
+        raise HTTPException(409, "Payment intent is only available for booked or confirmed consultations")
+
+    active = db.scalar(
+        select(Payment).where(
+            Payment.consultation_id == consultation.id,
+            Payment.status.in_(["pending", "succeeded"]),
+        )
+    )
+    if active:
+        raise HTTPException(409, "An active payment record already exists for this consultation")
+
+    payment = Payment(
+        consultation_id=consultation.id,
+        patient_id=patient.id,
+        amount_minor=_consultation_fee_minor(),
+        currency="INR",
+        status="pending",
+        provider="unconfigured",
+        idempotency_key=idempotency_key,
+    )
+    db.add(payment)
+    try:
+        db.flush()
+        audit(db, patient.id, "payment.intent_created", "payment", payment.id, "status=pending; currency=INR")
+        db.commit()
+        db.refresh(payment)
+        return payment
+    except IntegrityError:
+        db.rollback()
+        # Cover concurrent retries: return the committed record for the same request.
+        prior = db.scalar(select(Payment).where(Payment.idempotency_key == idempotency_key))
+        if prior and prior.patient_id == patient.id and prior.consultation_id == consultation_id:
+            response.status_code = 200
+            return prior
+        raise HTTPException(409, "A payment intent was concurrently created; retrieve its status before retrying")
+
+
+@router.get("/payments/{payment_id}", response_model=PaymentOut, tags=["payments"])
+def get_payment(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    payment = db.get(Payment, payment_id)
+    if not payment or (user.role != "admin" and payment.patient_id != user.id):
+        raise HTTPException(404, "Payment not found")
+    return payment
+
+
+@router.patch(
+    "/admin/payments/{payment_id}/status",
+    response_model=PaymentOut,
+    tags=["payments", "admin"],
+)
+def reconcile_payment_status(
+    payment_id: int,
+    data: PaymentStatusUpdateIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_roles("admin")),
+):
+    payment = db.scalar(select(Payment).where(Payment.id == payment_id).with_for_update())
+    if not payment:
+        raise HTTPException(404, "Payment not found")
+    if data.status in {"succeeded", "refunded"} and not data.provider_reference:
+        raise HTTPException(422, "A reconciliation reference is required for succeeded or refunded status")
+    if payment.status == data.status:
+        return payment
+    allowed = {
+        "pending": {"succeeded", "failed", "cancelled"},
+        "succeeded": {"refunded"},
+        "failed": set(),
+        "cancelled": set(),
+        "refunded": set(),
+    }
+    if data.status not in allowed.get(payment.status, set()):
+        raise HTTPException(409, f"Cannot change payment from {payment.status} to {data.status}")
+
+    old_status = payment.status
+    payment.status = data.status
+    if data.provider_reference:
+        payment.provider_reference = data.provider_reference
+    audit(
+        db,
+        admin.id,
+        "payment.status_reconciled",
+        "payment",
+        payment.id,
+        f"{old_status}->{data.status}; method=manual_admin_reconciliation",
+    )
+    db.commit()
+    db.refresh(payment)
+    return payment

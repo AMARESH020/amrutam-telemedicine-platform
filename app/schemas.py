@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
 class RegisterIn(BaseModel):
@@ -73,3 +74,24 @@ class StatusIn(BaseModel):
 
 class PrescriptionIn(BaseModel):
     notes: str = Field(min_length=1, max_length=10000)
+
+
+class PaymentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    consultation_id: int
+    patient_id: int
+    amount_minor: int
+    currency: str
+    status: str
+    provider: str
+    provider_reference: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PaymentStatusUpdateIn(BaseModel):
+    # Status changes are restricted to an authenticated administrator for manual
+    # reconciliation until a real, signature-verified provider webhook is integrated.
+    status: Literal["succeeded", "failed", "cancelled", "refunded"]
+    provider_reference: str | None = Field(default=None, min_length=1, max_length=200)

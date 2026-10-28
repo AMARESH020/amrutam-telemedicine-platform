@@ -27,7 +27,7 @@
 - [x] Input constraints and duplicate-email handling.
 - [x] Booking idempotency and database uniqueness constraints.
 - [x] Audit records for key business actions.
-- [ ] MFA fully implemented.
+- [x] TOTP MFA enrollment, encrypted secret storage, recovery-code single use and TOTP replay protection tested.
 - [ ] Centralized rate limiting.
 - [ ] Production key management and key rotation.
 - [ ] Automated dependency/image scanning and secret scanning.
@@ -35,3 +35,6 @@
 - [ ] Compliance review and retention schedule approved.
 
 This is an assignment/demo baseline, not a certification of regulatory compliance or production readiness.
+
+
+Payment-specific controls in this demo: the fee is server-configured, payment-intent creation is idempotent, one active payment record is permitted per consultation, patients can only see their own records, and manual reconciliation is admin-only, transition-checked and audited. Real gateway credentials, signed webhook verification, settlement/refund execution and reconciliation against provider statements remain unimplemented.

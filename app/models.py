@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, Text, UniqueConstraint,Index,text
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
+from sqlalchemy import CheckConstraint
 
 def utcnow_naive() -> datetime:
     """Return the current UTC time without timezone metadata for existing DB columns."""
@@ -83,3 +84,32 @@ class AuditLog(Base):
     resource_id: Mapped[str] = mapped_column(String(80))
     details: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class Payment(Base):
+    """Provider-neutral payment intent and reconciliation record; stores no card data."""
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consultation_id: Mapped[int] = mapped_column(ForeignKey("consultations.id"), index=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="INR", server_default="INR")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending", index=True)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="unconfigured", server_default="unconfigured")
+    provider_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, onupdate=utcnow_naive, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
+        CheckConstraint("amount_minor > 0", name="ck_payments_amount_positive"),
+        Index(
+            "uq_active_payment_consultation",
+            "consultation_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'succeeded')"),
+            sqlite_where=text("status IN ('pending', 'succeeded')"),
+        ),
+    )

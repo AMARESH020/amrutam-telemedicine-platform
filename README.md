@@ -48,4 +48,4 @@ pytest -q
 For local-only demo seeding, use a temporary script or database console; never expose a public admin-registration endpoint.
 
 ## Scope and limitations
-This is a focused assignment implementation, not a production-certified telemedicine platform. MFA, centralized rate limiting, payment/video integrations, durable async jobs, secret manager/key rotation, full migration workflow, load testing and verified disaster recovery remain production hardening tasks. See `docs/ARCHITECTURE.md` and `docs/SECURITY_THREAT_MODEL.md`.
+This is a focused assignment implementation, not a production-certified telemedicine platform. TOTP MFA is implemented; centralized rate limiting, real payment/video-provider integrations, durable async jobs, secret-manager/key rotation, full migration workflow, load testing and verified disaster recovery remain production hardening tasks. The payment API currently records provider-neutral intents and audited manual reconciliation only; it does not collect or transfer funds. See `docs/ARCHITECTURE.md` and `docs/SECURITY_THREAT_MODEL.md`.
