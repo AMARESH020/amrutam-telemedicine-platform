@@ -38,15 +38,13 @@ flowchart TD
 
     REDIS[Planned Shared Rate Limit and Cache]
     QUEUE[Planned Durable Job Queue and Workers]
-    TRACE[Planned OpenTelemetry Collector]
+    TRACE[Jaeger OTLP Collector and Trace UI]
     API -. future integration .-> REDIS
     API -. future integration .-> QUEUE
-    API -. future integration .-> TRACE
+    API --> TRACE
 ```
 
-The deployed assignment implementation uses the FastAPI application and PostgreSQL. The TLS load balancer, Redis-based distributed controls, durable worker queue, and OpenTelemetry collection shown as planned components are production architecture recommendations, not components currently delivered by the local Docker Compose stack.
-
-The API exposes `/health`, `/metrics`, and FastAPI-generated OpenAPI endpoints at `/openapi.json` and `/docs`. Request logging includes request identifiers. Prometheus metrics are exposed by the application; a production metrics backend, alerting policy, and distributed tracing deployment are still needed.
+The local Docker Compose stack runs FastAPI, PostgreSQL, and Jaeger. The API exposes `/health`, `/metrics`, and OpenAPI endpoints at `/openapi.json` and `/docs`. Request logs are structured JSON and include request IDs. Prometheus counters and latency histograms are exposed at `/metrics`. When running under Compose, OpenTelemetry exports FastAPI request and SQLAlchemy database spans over OTLP/HTTP to Jaeger, available at `http://localhost:16686`. A production metrics backend, alerting policy, trace retention, and production-grade collection deployment still need to be designed and operated.
 
 ## 3. Booking sequence and transaction boundaries
 
@@ -227,9 +225,9 @@ Never log passwords, bearer tokens, recovery codes, payment secrets, or clinical
 
 ## 10. Observability and operations
 
-Implemented observability includes request JSON logs with request identifiers and a Prometheus `/metrics` endpoint. `/health` provides an application health check. A production deployment should add database-aware readiness, a metrics backend, alerts, distributed tracing via OpenTelemetry, and dashboards for request rate, error rate, latency, database pool pressure, booking conflicts, authentication failures, and job-queue lag.
+Implemented observability includes JSON request logs with request IDs, Prometheus request counters and latency histograms, an application health endpoint, and OpenTelemetry distributed traces. The local Compose deployment sends FastAPI and SQLAlchemy spans to Jaeger. A real `GET /api/v1/doctors` trace has been verified with HTTP, connection, and SQL query spans. Production readiness still requires a metrics backend, alerts, retained traces, database-aware readiness, and dashboards for request rate, error rate, latency, connection-pool pressure, booking conflicts, authentication failures, and queue lag.
 
-The repository's CI workflow installs dependencies, compiles Python files, runs automated tests, and audits Python dependencies. Container image scanning, secret scanning, deployment approvals, and database migration integration tests should be added to CI.
+The repository's CI workflow installs dependencies, compiles Python files, runs automated tests, and audits Python dependencies. PostgreSQL migration integration tests run in CI. Container image scanning, secret scanning, and deployment approvals remain outstanding.
 
 ## 11. Availability, backup and disaster recovery
 
@@ -247,8 +245,8 @@ Production readiness requires a defined recovery-point objective (RPO) and recov
 | Consultation lifecycle and prescriptions | Implemented |
 | Payment-intent records and admin reconciliation | Implemented; no real gateway |
 | Audit events and admin analytics | Implemented |
-| Request logs and Prometheus metrics | Implemented; production dashboards/alerts needed |
-| Distributed tracing | Not implemented |
+| Request logs, Prometheus metrics, and traces | Implemented locally; production dashboards/alerts/retention needed |
+| Distributed tracing | Implemented locally using OpenTelemetry and Jaeger |
 | Shared rate limiting and Redis cache | Not implemented |
 | Durable asynchronous workers/outbox | Not implemented |
 | Load test for target latency/throughput | Not completed |

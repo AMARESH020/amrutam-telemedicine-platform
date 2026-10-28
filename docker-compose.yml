@@ -1,4 +1,4 @@
-services:
+﻿services:
   db:
     image: postgres:16-alpine
     environment:
@@ -14,6 +14,15 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
   api:
     build: .
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
@@ -21,12 +30,16 @@ services:
       DATABASE_URL: postgresql+psycopg://amrutam:${POSTGRES_PASSWORD:-change_me_local_only}@db:5432/amrutam
       JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-before-deployment}
       MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY}
-
       APP_ENV: development
+      OTEL_SERVICE_NAME: amrutam-telemedicine-api
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      jaeger:
+        condition: service_started
+
 volumes:
   postgres_data:

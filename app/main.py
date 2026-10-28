@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 from app.config import settings
+from app.db import engine
+from app.telemetry import configure_tracing
 from app.routes import router
 from app.rate_limit import check_rate_limit
 
@@ -119,3 +121,7 @@ def health():
         "status": "ok",
         "service": "amrutam-telemedicine-api",
     }
+
+# Configure tracing only when an OTLP endpoint is configured.
+tracing_enabled = configure_tracing(app, engine)
+logger.info("distributed_tracing_enabled=%s", tracing_enabled)

@@ -1,7 +1,7 @@
 fastapi>=0.133.0,<1.0
 starlette>=1.10.0,<2.0
 uvicorn[standard]>=0.30,<1.0
-sqlalchemy>=2.0,<3.0
+sqlalchemy>=2.0,<2.1
 alembic>=1.13,<2.0
 psycopg[binary]>=3.2,<4.0
 pydantic-settings>=2.5,<3.0
@@ -15,3 +15,10 @@ httpx>=0.27,<1.0
 python-multipart
 prometheus-client>=0.20,<1.0
 pyotp>=2.9,<3.0
+
+# Distributed tracing
+opentelemetry-api>=1.30,<2.0
+opentelemetry-sdk>=1.30,<2.0
+opentelemetry-exporter-otlp-proto-http>=1.30,<2.0
+opentelemetry-instrumentation-fastapi>=0.51b0,<1.0
+opentelemetry-instrumentation-sqlalchemy>=0.51b0,<1.0

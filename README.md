@@ -14,13 +14,14 @@ Copy-Item .env.example .env
 # For SQLite smoke tests, set DATABASE_URL=sqlite:///./amrutam.db in .env
 uvicorn app.main:app --reload
 ```
-Open `http://localhost:8000/docs`, `http://localhost:8000/health`, and `http://localhost:8000/metrics`.
+Open `http://localhost:8000/docs`, `http://localhost:8000/health`, `http://localhost:8000/metrics`, and `http://localhost:16686` (Jaeger UI when using Docker Compose).
 
 ## Run with Docker Compose
 1. Copy `.env.example` to `.env`.
 2. Set `POSTGRES_PASSWORD` and `JWT_SECRET` to strong unique values in your shell/environment.
 3. Run `docker compose up --build`.
 4. Open `http://localhost:8000/docs`.
+5. Open `http://localhost:16686` to inspect OpenTelemetry traces in Jaeger. The Compose stack exports FastAPI and SQLAlchemy spans to Jaeger over OTLP/HTTP.
 
 Do not use example secrets outside local development. Do not commit `.env`.
 
