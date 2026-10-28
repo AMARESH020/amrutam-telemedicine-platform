@@ -38,3 +38,30 @@ This is an assignment/demo baseline, not a certification of regulatory complianc
 
 
 Payment-specific controls in this demo: the fee is server-configured, payment-intent creation is idempotent, one active payment record is permitted per consultation, patients can only see their own records, and manual reconciliation is admin-only, transition-checked and audited. Real gateway credentials, signed webhook verification, settlement/refund execution and reconciliation against provider statements remain unimplemented.
+
+## Account-aware authentication cooldown
+
+**Threat:** Distributed password guessing against a user account can evade
+a purely IP-based limit by sending requests from multiple addresses.
+
+**Implemented controls:**
+- Track failed password and MFA authentication by an HMAC-derived account
+  identifier, rather than putting raw email addresses in Redis keys.
+- Keep failure counts for 15 minutes after the most recent failed attempt.
+- Start a bounded progressive cooldown after six failed attempts, increasing
+  the delay up to 30 seconds.
+- Clear account failure state after successful authentication.
+- Return HTTP 429 and Retry-After when a failed attempt encounters an active
+  cooldown. Return HTTP 503 when the configured Redis protection is unavailable
+  rather than silently bypassing it.
+- Do not impose a permanent account lock; a complete valid credential sequence
+  can still authenticate during a cooldown.
+
+**Residual risks and verification limits:** account-specific rate limiting
+does not replace IP-based throttling, gateway/WAF controls, MFA, alerting, or
+monitoring. Since an incorrect password is verified before the cooldown check,
+an attacker can still impose password-hashing work. The account-specific Redis
+path has fake-client unit tests, but its live-Redis behavior, multi-replica
+abuse handling, and production capacity have not been independently validated.
+The production JWT secret must be strong and stable because it is used to
+derive account limiter keys.

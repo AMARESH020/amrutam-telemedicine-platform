@@ -49,4 +49,34 @@ pytest -q
 For local-only demo seeding, use a temporary script or database console; never expose a public admin-registration endpoint.
 
 ## Scope and limitations
-This is a focused assignment implementation, not a production-certified telemedicine platform. TOTP MFA and Redis-backed shared IP rate limiting for login, token, and registration are implemented. Broader gateway/WAF protections, per-account limits, real payment/video-provider integrations, durable async jobs, managed secret/key rotation, production load testing, and verified disaster recovery remain production hardening tasks. The payment API currently records provider-neutral intents and audited manual reconciliation only; it does not collect or transfer funds. See `docs/ARCHITECTURE.md` and `docs/SECURITY_THREAT_MODEL.md`.
+This is a focused assignment implementation, not a production-certified telemedicine platform. TOTP MFA and Redis-backed shared IP rate limiting for login, token, and registration are implemented. Broader gateway/WAF protections, production validation and tuning of account-aware cooldowns, real payment/video-provider integrations, durable async jobs, managed secret/key rotation, production load testing, and verified disaster recovery remain production hardening tasks. The payment API currently records provider-neutral intents and audited manual reconciliation only; it does not collect or transfer funds. See `docs/ARCHITECTURE.md` and `docs/SECURITY_THREAT_MODEL.md`.
+
+## Account-aware authentication cooldown
+
+In addition to Redis-backed IP rate limiting, password and MFA failures are
+tracked per account. Account identifiers are HMAC-SHA256 digests derived from
+the normalized email address and the configured JWT secret; raw email
+addresses are not included in the account-limiter Redis keys.
+
+The failure counter expires after 15 minutes of inactivity. Beginning with
+the sixth failed password or MFA attempt, the limiter applies progressively
+longer cooldowns: 1, 2, 4, 8, and 16 seconds, then a maximum of 30 seconds.
+A successful authentication clears the account failure state. Missing and
+invalid MFA codes are counted as failed authentication attempts.
+
+The policy does not permanently lock accounts. A complete valid credential
+sequence can still succeed during a cooldown, preventing an attacker from
+using the cooldown as a simple account-lockout mechanism. Failed attempts
+during an active cooldown receive HTTP 429 with a Retry-After header.
+If Redis is unavailable, or Redis is not configured in production, the
+account limiter fails closed with HTTP 503.
+
+Operational limitations: account cooldowns do not replace IP throttling,
+MFA, monitoring, or gateway/WAF protections. The cooldown check for an
+incorrect password occurs after password verification, so it does not by
+itself eliminate password-hashing CPU costs. Account-specific Redis behavior
+has unit coverage using a fake Redis client; production load, multi-replica
+abuse scenarios, and account-limiter operation against a live Redis service
+remain to be validated. Keep the production JWT secret strong and stable:
+rotating it changes account-key digests, so prior counters remain under their
+old keys until they expire.
